@@ -247,4 +247,171 @@ elif choice == "Manage Swimmers":
 
     with tab2:
         st.subheader("Upload Class List")
-        template_data = {'First Name': [], '
+        template_data = {'First Name': [], 'Surname': [], 'DOB': [], 'Gender': [], 'Grade': [], 'House': []}
+        csv_template = pd.DataFrame(template_data).to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Download Blank CSV Template", csv_template, "template.csv", "text/csv")
+        
+        uploaded_file = st.file_uploader("Choose CSV", type="csv")
+        if uploaded_file:
+            df = pd.read_csv(uploaded_file)
+            st.write("Preview:", df.head())
+            if st.button("Import Data"):
+                count = 0
+                for index, row in df.iterrows():
+                    try:
+                        db.collection('swimmers').add({
+                            "first_name": row['First Name'], "surname": row['Surname'],
+                            "dob": row['DOB'], "gender": row['Gender'],
+                            "grade": int(row['Grade']), "house": row['House'], "active": True
+                        })
+                        count += 1
+                    except Exception as e:
+                        st.write(f"Error on row {index}: {e}")
+                st.success(f"Imported {count} swimmers.")
+
+elif choice == "Rankings":
+    st.header("🏆 Interhouse Team Selection")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    r_grade = col1.selectbox("Grade", [4, 5, 6, 7])
+    r_stroke = col2.selectbox("Stroke", ["Freestyle", "Breaststroke", "Backstroke", "Butterfly"])
+    r_gender = col3.selectbox("Gender", ["M", "F"])
+    
+    # UPDATED RANKING METHOD
+    calc_method = col4.radio("Method", ["Best Time", "Average of Last N", "Last Swim"])
+    
+    n_val = 3
+    if calc_method == "Average of Last N":
+        n_val = st.slider("N", 2, 5, 3)
+
+    swimmers_ref = db.collection('swimmers')
+    q_swimmers = swimmers_ref.where('grade', '==', r_grade).where('gender', '==', r_gender).stream()
+    
+    swimmer_list = []
+    for doc in q_swimmers:
+        d = doc.to_dict()
+        d['swimmer_id'] = doc.id
+        swimmer_list.append(d)
+    df_swimmers = pd.DataFrame(swimmer_list)
+
+    if not df_swimmers.empty:
+        results_ref = db.collection('results')
+        q_results = results_ref.where('stroke', '==', r_stroke).stream()
+        
+        result_list = []
+        for doc in q_results:
+            d = doc.to_dict()
+            result_list.append(d)
+        df_results = pd.DataFrame(result_list)
+        
+        if not df_results.empty:
+            df_merged = pd.merge(df_swimmers, df_results, on="swimmer_id")
+            
+            if not df_merged.empty:
+                ranked_data = []
+                grouped = df_merged.groupby(['first_name', 'surname', 'house'])
+                
+                for name, group in grouped:
+                    final_time = 0.0
+                    note = ""
+                    
+                    # LOGIC FOR CALCULATIONS
+                    if calc_method == "Best Time":
+                        final_time = group['time_seconds'].min()
+                        note = f"Best of {len(group)}"
+                    
+                    elif calc_method == "Last Swim":
+                        # Sort by Date descending
+                        group = group.sort_values(by='date_swum', ascending=False)
+                        # Take the first one (most recent)
+                        final_time = group.iloc[0]['time_seconds']
+                        note = f"Date: {group.iloc[0]['date_swum']}"
+
+                    else: # Average of Last N
+                        group = group.sort_values(by='date_swum', ascending=False)
+                        top_n = group.head(n_val)
+                        final_time = top_n['time_seconds'].mean()
+                        note = f"Avg of {len(top_n)}"
+
+                    ranked_data.append({
+                        "First Name": name[0],
+                        "Surname": name[1],
+                        "House": name[2],
+                        "Rank Time": round(final_time, 2),
+                        "Note": note
+                    })
+                
+                df_rank = pd.DataFrame(ranked_data).sort_values("Rank Time").reset_index(drop=True)
+                df_rank.index += 1
+                
+                st.dataframe(df_rank, use_container_width=True)
+                
+                st.divider()
+                st.subheader("Top 3 Per House")
+                houses = ["Bromhead", "Christie", "Clark", "Melville"]
+                cols = st.columns(len(houses))
+                for i, h in enumerate(houses):
+                    with cols[i]:
+                        st.markdown(f"**{h}**")
+                        team = df_rank[df_rank['House'] == h].head(3)
+                        if not team.empty:
+                            st.table(team[['First Name', 'Surname', 'Rank Time']])
+                        else:
+                            st.caption("No qualifiers")
+            else:
+                st.warning("No results found.")
+        else:
+            st.warning("No results entered yet.")
+    else:
+        st.warning("No swimmers found.")
+
+elif choice == "Gala Reports":
+    st.header("🖨️ PDF Reports")
+    st.info("Generates PDF based on Cloud Data.")
+    if st.button("Generate PDF"):
+        df_swimmers = load_collection_to_df('swimmers')
+        df_results = load_collection_to_df('results')
+        
+        if not df_swimmers.empty and not df_results.empty:
+            df_swimmers = df_swimmers.rename(columns={'id': 'swimmer_id'})
+            df_full = pd.merge(df_swimmers, df_results, on="swimmer_id")
+            
+            pdf = FPDF()
+            pdf.add_page()
+            pdf.set_font("Arial", "B", 16)
+            pdf.cell(0, 10, "Pelham Senior Primary - Gala Report", ln=1, align="C")
+            pdf.ln(10)
+            
+            houses = ["Bromhead", "Christie", "Clark", "Melville"]
+            for house in houses:
+                pdf.set_font("Arial", "B", 14)
+                pdf.set_fill_color(200, 220, 255)
+                pdf.cell(0, 10, f"TEAM: {house}", 1, 1, 'L', fill=True)
+                pdf.ln(2)
+                
+                house_data = df_full[df_full['house'] == house]
+                pdf.set_font("Arial", "", 10)
+                for grade in [4, 5, 6, 7]:
+                    for gender in ['F', 'M']:
+                        for stroke in ["Freestyle", "Breaststroke", "Backstroke", "Butterfly"]:
+                            race_data = house_data[
+                                (house_data['grade'] == grade) &
+                                (house_data['gender'] == gender) &
+                                (house_data['stroke'] == stroke)
+                            ]
+                            if not race_data.empty:
+                                race_data = race_data.sort_values("time_seconds").head(3)
+                                names = ", ".join([f"{r['first_name']} {r['surname']} ({r['time_seconds']}s)" for i, r in race_data.iterrows()])
+                                label = f"Gr{grade} {gender} {stroke}:"
+                                pdf.set_font("Arial", "B", 10)
+                                pdf.cell(50, 6, label, border=0)
+                                pdf.set_font("Arial", "", 10)
+                                pdf.multi_cell(0, 6, names, border=0)
+                pdf.ln(5)
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                pdf.output(tmp_file.name)
+                with open(tmp_file.name, "rb") as file:
+                    st.download_button("Download PDF", file.read(), "Pelham_Gala_Report.pdf")
+        else:
+            st.error("Not enough data.")
