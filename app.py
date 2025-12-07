@@ -9,7 +9,6 @@ from firebase_admin import credentials, firestore
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Pelham Swimming", page_icon="🏊", layout="wide")
 
-# Custom CSS
 st.markdown("""
     <style>
     .stApp { background-color: #f9f9f9; }
@@ -53,6 +52,23 @@ def load_collection_to_df(collection_name):
         return pd.DataFrame()
     return pd.DataFrame(data)
 
+# --- HELPER: CALCULATE AGE GROUP ---
+def calculate_age_group(dob_str):
+    try:
+        # Convert string YYYY-MM-DD to date object
+        dob = datetime.strptime(str(dob_str), "%Y-%m-%d")
+        current_year = datetime.now().year
+        age_turning = current_year - dob.year
+        
+        # Standard Schools naming convention: U9, U10, U11, U12, Open (13+)
+        if age_turning <= 9: return "U9"
+        elif age_turning == 10: return "U10"
+        elif age_turning == 11: return "U11"
+        elif age_turning == 12: return "U12"
+        else: return "Open"
+    except:
+        return "Unknown"
+
 # --- SIDEBAR ---
 st.sidebar.title("Pelham Swimming")
 menu_options = [
@@ -60,7 +76,7 @@ menu_options = [
     "Enter Times (Batch)", 
     "Edit/Fix Results", 
     "Manage Swimmers", 
-    "Rankings", 
+    "Rankings (Age Group)", 
     "Gala Reports"
 ]
 choice = st.sidebar.radio("Go to:", menu_options)
@@ -80,7 +96,9 @@ if choice == "Home":
         st.metric("Status", "Connecting...")
 
 elif choice == "Enter Times (Batch)":
-    st.header("⏱️ Batch Time Entry")
+    st.header("⏱️ Batch Time Entry (By Grade)")
+    st.info("Teachers enter data by Grade, but rankings will be calculated by Age Group.")
+    
     c1, c2, c3 = st.columns(3)
     grade_filter = c1.selectbox("Grade", [4, 5, 6, 7])
     stroke_filter = c2.selectbox("Stroke", ["Freestyle", "Breaststroke", "Backstroke", "Butterfly"])
@@ -154,10 +172,8 @@ elif choice == "Enter Times (Batch)":
     else:
         st.warning("No swimmers found.")
 
-# --- NEW SECTION: EDIT RESULTS (FIXED) ---
 elif choice == "Edit/Fix Results":
     st.header("✏️ Edit or Fix Results")
-    st.info("Select a swimmer to view and correct their history.")
     
     all_swimmers = load_collection_to_df('swimmers')
     if not all_swimmers.empty:
@@ -184,15 +200,13 @@ elif choice == "Edit/Fix Results":
         if not df_history.empty:
             st.subheader(f"History for {selected_swimmer_name}")
             
-            # --- THE FIX IS HERE ---
-            # We must convert the string dates from database into Real Date Objects
             if 'date_swum' in df_history.columns:
                 df_history['date_swum'] = pd.to_datetime(df_history['date_swum']).dt.date
                 
             edited_history = st.data_editor(
                 df_history,
                 column_config={
-                    "doc_id": st.column_config.TextColumn(disabled=True, help="System ID"),
+                    "doc_id": st.column_config.TextColumn(disabled=True),
                     "season": st.column_config.NumberColumn(disabled=True),
                     "source": st.column_config.TextColumn(disabled=True),
                     "logged_by": st.column_config.TextColumn(disabled=True),
@@ -210,7 +224,6 @@ elif choice == "Edit/Fix Results":
                 updated_count = 0
                 for index, row in edited_history.iterrows():
                     doc_ref = db.collection('results').document(row['doc_id'])
-                    # Convert Date Object back to String for storage
                     doc_ref.update({
                         "time_seconds": float(row['time_seconds']),
                         "date_swum": str(row['date_swum']), 
@@ -220,7 +233,7 @@ elif choice == "Edit/Fix Results":
                     progress.progress((index + 1) / len(edited_history))
                 st.success("History updated successfully!")
         else:
-            st.warning("No results found for this swimmer.")
+            st.warning("No results found.")
     else:
         st.warning("No swimmers in database.")
 
@@ -250,12 +263,8 @@ elif choice == "Manage Swimmers":
     with tab2:
         st.subheader("Upload Class List")
         template_data = {
-            'First Name': [], 
-            'Surname': [], 
-            'DOB': [], 
-            'Gender': [], 
-            'Grade': [], 
-            'House': []
+            'First Name': [], 'Surname': [], 'DOB': [], 
+            'Gender': [], 'Grade': [], 'House': []
         }
         csv_template = pd.DataFrame(template_data).to_csv(index=False).encode('utf-8')
         st.download_button("📥 Download Blank CSV Template", csv_template, "template.csv", "text/csv")
@@ -278,11 +287,12 @@ elif choice == "Manage Swimmers":
                         st.write(f"Error on row {index}: {e}")
                 st.success(f"Imported {count} swimmers.")
 
-elif choice == "Rankings":
+elif choice == "Rankings (Age Group)":
     st.header("🏆 Interhouse Team Selection")
     
     col1, col2, col3, col4 = st.columns(4)
-    r_grade = col1.selectbox("Grade", [4, 5, 6, 7])
+    # CHANGED: Select Age Group instead of Grade
+    r_age_group = col1.selectbox("Age Group", ["U9", "U10", "U11", "U12", "Open"])
     r_stroke = col2.selectbox("Stroke", ["Freestyle", "Breaststroke", "Backstroke", "Butterfly"])
     r_gender = col3.selectbox("Gender", ["M", "F"])
     calc_method = col4.radio("Method", ["Best Time", "Average of Last N", "Last Swim"])
@@ -291,14 +301,23 @@ elif choice == "Rankings":
     if calc_method == "Average of Last N":
         n_val = st.slider("N", 2, 5, 3)
 
+    # 1. Fetch ALL swimmers (we must calculate age for everyone to check if they match)
+    # This is slightly inefficient but necessary unless we store AgeGroup in database
     swimmers_ref = db.collection('swimmers')
-    q_swimmers = swimmers_ref.where('grade', '==', r_grade).where('gender', '==', r_gender).stream()
+    # Filter by Gender to speed it up
+    q_swimmers = swimmers_ref.where('gender', '==', r_gender).stream()
     
     swimmer_list = []
     for doc in q_swimmers:
         d = doc.to_dict()
+        # Calculate Age Group
+        d['age_group'] = calculate_age_group(d.get('dob'))
         d['swimmer_id'] = doc.id
-        swimmer_list.append(d)
+        
+        # Only keep if they match the selected Age Group
+        if d['age_group'] == r_age_group:
+            swimmer_list.append(d)
+            
     df_swimmers = pd.DataFrame(swimmer_list)
 
     if not df_swimmers.empty:
@@ -365,16 +384,19 @@ elif choice == "Rankings":
         else:
             st.warning("No results entered yet.")
     else:
-        st.warning("No swimmers found.")
+        st.warning(f"No swimmers found in Age Group {r_age_group}.")
 
 elif choice == "Gala Reports":
-    st.header("🖨️ PDF Reports")
-    st.info("Generates PDF based on Cloud Data.")
+    st.header("🖨️ PDF Reports (By Age Group)")
+    st.info("Generates PDF based on Age Groups (U9, U10, U11, U12, Open).")
     if st.button("Generate PDF"):
         df_swimmers = load_collection_to_df('swimmers')
         df_results = load_collection_to_df('results')
         
         if not df_swimmers.empty and not df_results.empty:
+            # Calculate Age Group for everyone
+            df_swimmers['age_group'] = df_swimmers['dob'].apply(calculate_age_group)
+            
             df_swimmers = df_swimmers.rename(columns={'id': 'swimmer_id'})
             df_full = pd.merge(df_swimmers, df_results, on="swimmer_id")
             
@@ -382,28 +404,30 @@ elif choice == "Gala Reports":
             
             # --- PART A: HOUSE TEAM LISTS ---
             houses = ["Bromhead", "Christie", "Clark", "Melville"]
+            age_groups = ["U9", "U10", "U11", "U12", "Open"]
+            
             for house in houses:
                 pdf.add_page()
                 pdf.set_font("Arial", "B", 16)
                 pdf.cell(0, 10, f"Pelham Senior Primary - {house}", ln=1, align="C")
                 pdf.set_font("Arial", "B", 14)
                 pdf.set_fill_color(200, 220, 255)
-                pdf.cell(0, 10, f"TEAM LIST", 1, 1, 'C', fill=True)
+                pdf.cell(0, 10, f"TEAM LIST (By Age Group)", 1, 1, 'C', fill=True)
                 pdf.ln(5)
                 
                 house_data = df_full[df_full['house'] == house]
                 pdf.set_font("Arial", "", 10)
                 
-                for grade in [4, 5, 6, 7]:
+                for age_group in age_groups:
                     for gender in ['F', 'M']:
                         gender_label = "Girls" if gender == 'F' else "Boys"
                         pdf.set_font("Arial", "B", 11)
-                        pdf.cell(0, 8, f"Grade {grade} {gender_label}", 0, 1, 'L')
+                        pdf.cell(0, 8, f"{age_group} {gender_label}", 0, 1, 'L')
                         pdf.set_font("Arial", "", 10)
                         
                         for stroke in ["Freestyle", "Breaststroke", "Backstroke", "Butterfly"]:
                             race_data = house_data[
-                                (house_data['grade'] == grade) &
+                                (house_data['age_group'] == age_group) &
                                 (house_data['gender'] == gender) &
                                 (house_data['stroke'] == stroke)
                             ]
@@ -420,14 +444,13 @@ elif choice == "Gala Reports":
             pdf.cell(0, 10, "OFFICIAL EVENT HEAT SHEETS", ln=1, align="C")
             pdf.ln(5)
             
-            for grade in [4, 5, 6, 7]:
+            for age_group in age_groups:
                 for stroke in ["Freestyle", "Breaststroke", "Backstroke", "Butterfly"]:
                     for gender in ['F', 'M']:
                         gender_label = "Girls" if gender == 'F' else "Boys"
                         
-                        # Find Top 3 from EVERY house
                         race_data = df_full[
-                            (df_full['grade'] == grade) &
+                            (df_full['age_group'] == age_group) &
                             (df_full['gender'] == gender) &
                             (df_full['stroke'] == stroke)
                         ]
@@ -443,7 +466,7 @@ elif choice == "Gala Reports":
                                 
                                 if not heat_df.empty:
                                     pdf.set_font("Arial", "B", 11)
-                                    pdf.cell(0, 8, f"Event: Gr {grade} {gender_label} {stroke}", 0, 1, 'L', fill=True)
+                                    pdf.cell(0, 8, f"Event: {age_group} {gender_label} {stroke}", 0, 1, 'L', fill=True)
                                     
                                     pdf.set_font("Arial", "B", 9)
                                     pdf.cell(60, 6, "Name", 1)
